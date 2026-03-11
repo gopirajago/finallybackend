@@ -1,0 +1,33 @@
+{
+  "name": "Finally Backend",
+  "description": "FastAPI backend for Finally trading app",
+  "repository": "https://github.com/gopirajago/finallybackend",
+  "keywords": ["fastapi", "python", "trading"],
+  "addons": [
+    {
+      "plan": "heroku-postgresql:essential-0"
+    }
+  ],
+  "env": {
+    "SECRET_KEY": {
+      "description": "JWT secret key — use a long random string",
+      "required": true
+    },
+    "ALLOWED_ORIGINS_CSV": {
+      "description": "Comma-separated list of allowed CORS origins, e.g. https://yourapp.netlify.app",
+      "required": false,
+      "value": "http://localhost:5173"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  }
+}
