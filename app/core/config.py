@@ -26,6 +26,7 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://localhost:3000",
         "https://trdlybackend-323da282cc04.herokuapp.com",
+        "https://algotradex-1feb03ba74fa.herokuapp.com",
     ]
 
     DATABASE_URL: str = "postgresql+asyncpg://localhost/app"
