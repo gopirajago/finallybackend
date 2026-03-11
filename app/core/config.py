@@ -21,10 +21,11 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-me-in-production"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
 
-    # Comma-separated origins in env: ALLOWED_ORIGINS=https://app.com,https://www.app.com
+    # Comma-separated origins in env: ALLOWED_ORIGINS_CSV=https://app.netlify.app,https://www.app.com
     ALLOWED_ORIGINS: List[str] = [
         "http://localhost:5173",
         "http://localhost:3000",
+        "https://trdlybackend-323da282cc04.herokuapp.com",
     ]
 
     DATABASE_URL: str = "postgresql+asyncpg://localhost/app"
