@@ -500,7 +500,7 @@ async def get_signals(
             "symbol": symbol,
             "interval": interval,
             "ltp": ltp,
-            "candles": candles,
+            "candle_count": len(candles),
             "analysis": analysis,
             "timestamp": int(datetime.now().timestamp()),
         }
@@ -731,7 +731,7 @@ async def get_ai_signal(
         "symbol": symbol,
         "interval": interval,
         "ltp": ltp,
-        "candles": candles,
+        "candle_count": len(candles),
         "analysis": analysis,
         "ai_signal": ai_signal,
         "news": news,

@@ -38,7 +38,7 @@ async def register(
     existing = await db.execute(
         select(User).where((User.email == data.email) | (User.username == data.username))
     )
-    if existing.scalar_one_or_none():
+    if existing.first():
         raise HTTPException(status_code=400, detail="Email or username already registered")
 
     user = User(
