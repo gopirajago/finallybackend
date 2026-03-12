@@ -124,10 +124,9 @@ async def _capture_snapshot_for_user(user_id: int, access_token: str, raise_erro
                 PortfolioSnapshot.snapshot_date == today,
             )
         )
-        existing = result.scalar_one_or_none()
-        if existing:
+        for existing in result.scalars().all():
             await db.delete(existing)
-            await db.flush()
+        await db.flush()
 
         snapshot = PortfolioSnapshot(
             user_id=user_id,
