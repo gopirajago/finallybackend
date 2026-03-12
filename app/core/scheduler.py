@@ -93,6 +93,28 @@ async def _capture_snapshot_for_user(user_id: int, access_token: str, raise_erro
         qty = float(h.get("quantity", h.get("holdingQuantity", 0)) or 0)
         avg_price = float(h.get("average_price", h.get("averagePrice", 0)) or 0)
         ltp = float(h.get("ltp", h.get("last_traded_price", 0)) or 0)
+
+        # If Groww didn't return LTP (e.g. after market hours), fetch via quote
+        if not ltp and symbol:
+            try:
+                _old_stdout = sys.stdout
+                _old_stderr = sys.stderr
+                sys.stdout = io.StringIO()
+                sys.stderr = io.StringIO()
+                try:
+                    quote = groww.get_quote(
+                        trading_symbol=symbol,
+                        exchange="NSE",
+                        segment="CASH",
+                    )
+                finally:
+                    sys.stdout = _old_stdout
+                    sys.stderr = _old_stderr
+                if isinstance(quote, dict):
+                    ltp = float(quote.get("last_price") or quote.get("ltp") or 0)
+            except Exception:
+                ltp = 0.0
+
         invested = qty * avg_price
         current_val = qty * ltp if ltp else invested
         pnl = current_val - invested

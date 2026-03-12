@@ -140,6 +140,23 @@ async def get_live_summary(
         qty = float(h.get("quantity", h.get("holdingQuantity", 0)) or 0)
         avg_price = float(h.get("average_price", h.get("averagePrice", 0)) or 0)
         ltp = float(h.get("ltp", h.get("last_traded_price", 0)) or 0)
+
+        # Groww doesn't return LTP after market hours — fetch via quote
+        if not ltp and symbol:
+            try:
+                def _get_quote(sym=symbol):
+                    _o, _e = sys.stdout, sys.stderr
+                    sys.stdout = sys.stderr = io.StringIO()
+                    try:
+                        return groww.get_quote(trading_symbol=sym, exchange="NSE", segment="CASH")
+                    finally:
+                        sys.stdout, sys.stderr = _o, _e
+                quote = await loop.run_in_executor(None, _get_quote)
+                if isinstance(quote, dict):
+                    ltp = float(quote.get("last_price") or quote.get("ltp") or 0)
+            except Exception:
+                ltp = 0.0
+
         invested = qty * avg_price
         current_val = qty * ltp if ltp else invested
         pnl = current_val - invested
