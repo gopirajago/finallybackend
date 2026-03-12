@@ -138,6 +138,9 @@ def _serialize(s: PortfolioSnapshot) -> dict:
         "total_pnl_pct": s.total_pnl_pct,
         "holdings_count": s.holdings_count,
         "holdings_json": s.holdings_json,
+        "intraday_pnl": s.intraday_pnl,
+        "fno_pnl": s.fno_pnl,
+        "positions_json": s.positions_json,
         "captured_at": s.captured_at.isoformat(),
     }
 
@@ -153,4 +156,6 @@ def _serialize_summary(s: PortfolioSnapshot) -> dict:
         "total_pnl": s.total_pnl,
         "total_pnl_pct": s.total_pnl_pct,
         "holdings_count": s.holdings_count,
+        "intraday_pnl": s.intraday_pnl,
+        "fno_pnl": s.fno_pnl,
     }

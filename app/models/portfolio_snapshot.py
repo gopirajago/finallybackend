@@ -31,6 +31,11 @@ class PortfolioSnapshot(Base):
     total_pnl_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     holdings_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Intraday & FNO P&L (from positions)
+    intraday_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    fno_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    positions_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # Full holdings list as JSON: [{symbol, quantity, avg_price, ltp, pnl, pnl_pct}]
     holdings_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 

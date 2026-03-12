@@ -56,6 +56,7 @@ async def _capture_snapshot_for_user(user_id: int, access_token: str, raise_erro
         try:
             holdings_data = groww.get_holdings_for_user()
             capital_data = groww.get_available_margin_details()
+            positions_data = groww.get_positions_for_user()
         finally:
             sys.stdout = _old_stdout
             sys.stderr = _old_stderr
@@ -136,6 +137,67 @@ async def _capture_snapshot_for_user(user_id: int, access_token: str, raise_erro
 
     total_pnl = holdings_value - total_invested
     total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
+
+    # ── parse positions (intraday + FNO) ───────────────────────────────────
+    raw_positions = []
+    if isinstance(positions_data, dict):
+        raw_positions = positions_data.get("positions", []) or []
+    elif isinstance(positions_data, list):
+        raw_positions = positions_data
+
+    intraday_pnl = 0.0
+    fno_pnl = 0.0
+    positions_list = []
+
+    for p in raw_positions:
+        seg = (p.get("segment") or "").upper()
+        realised = float(p.get("realised_pnl") or 0)
+        qty = float(p.get("quantity") or 0)
+        symbol = p.get("trading_symbol") or p.get("symbol") or ""
+
+        # Unrealised P&L for open positions
+        unrealised = 0.0
+        if qty != 0:
+            net_price = float(p.get("net_price") or 0)
+            try:
+                _old_stdout = sys.stdout
+                _old_stderr = sys.stderr
+                sys.stdout = io.StringIO()
+                sys.stderr = io.StringIO()
+                try:
+                    exchange = p.get("exchange", "NSE")
+                    segment_val = "FNO" if seg == "FNO" else "CASH"
+                    quote = groww.get_quote(
+                        trading_symbol=symbol,
+                        exchange=exchange,
+                        segment=segment_val,
+                    )
+                finally:
+                    sys.stdout = _old_stdout
+                    sys.stderr = _old_stderr
+                if isinstance(quote, dict):
+                    ltp = float(quote.get("last_price") or quote.get("ltp") or 0)
+                    if ltp:
+                        unrealised = (ltp - net_price) * qty
+            except Exception:
+                pass
+
+        position_pnl = realised + unrealised
+
+        positions_list.append({
+            "symbol": symbol,
+            "segment": seg,
+            "quantity": qty,
+            "realised_pnl": round(realised, 2),
+            "unrealised_pnl": round(unrealised, 2),
+            "pnl": round(position_pnl, 2),
+        })
+
+        if seg == "FNO":
+            fno_pnl += position_pnl
+        else:
+            intraday_pnl += position_pnl
+
     today = date.today()
 
     async with AsyncSessionLocal() as db:
@@ -162,6 +224,9 @@ async def _capture_snapshot_for_user(user_id: int, access_token: str, raise_erro
             total_pnl_pct=round(total_pnl_pct, 2),
             holdings_count=len(holdings_list),
             holdings_json=holdings_list,
+            intraday_pnl=round(intraday_pnl, 2),
+            fno_pnl=round(fno_pnl, 2),
+            positions_json=positions_list,
             captured_at=datetime.now(timezone.utc),
         )
         db.add(snapshot)

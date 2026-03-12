@@ -113,9 +113,18 @@ async def get_live_summary(
             sys.stdout, sys.stderr = _o, _e
         return holdings_data, capital_data
 
+    def _fetch_positions():
+        _o, _e = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = io.StringIO()
+        try:
+            return groww.get_positions_for_user()
+        finally:
+            sys.stdout, sys.stderr = _o, _e
+
     try:
         loop = asyncio.get_event_loop()
         holdings_data, capital_data = await loop.run_in_executor(None, _fetch)
+        positions_data = await loop.run_in_executor(None, _fetch_positions)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -177,6 +186,55 @@ async def get_live_summary(
     total_pnl = holdings_value - total_invested
     total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
 
+    # ── positions (intraday + FNO) ────────────────────────────────────────
+    raw_positions = []
+    if isinstance(positions_data, dict):
+        raw_positions = positions_data.get("positions", []) or []
+    elif isinstance(positions_data, list):
+        raw_positions = positions_data
+
+    intraday_pnl = 0.0
+    fno_pnl = 0.0
+    positions_list = []
+
+    for p in raw_positions:
+        seg = (p.get("segment") or "").upper()
+        realised = float(p.get("realised_pnl") or 0)
+        qty = float(p.get("quantity") or 0)
+        symbol = p.get("trading_symbol") or p.get("symbol") or ""
+        unrealised = 0.0
+        if qty != 0:
+            net_price = float(p.get("net_price") or 0)
+            try:
+                def _get_pos_quote(sym=symbol, exch=p.get("exchange", "NSE"), sg=seg):
+                    _o, _e = sys.stdout, sys.stderr
+                    sys.stdout = sys.stderr = io.StringIO()
+                    try:
+                        return groww.get_quote(trading_symbol=sym, exchange=exch,
+                                               segment="FNO" if sg == "FNO" else "CASH")
+                    finally:
+                        sys.stdout, sys.stderr = _o, _e
+                q = await loop.run_in_executor(None, _get_pos_quote)
+                if isinstance(q, dict):
+                    ltp_p = float(q.get("last_price") or q.get("ltp") or 0)
+                    if ltp_p:
+                        unrealised = (ltp_p - net_price) * qty
+            except Exception:
+                pass
+        position_pnl = realised + unrealised
+        positions_list.append({
+            "symbol": symbol,
+            "segment": seg,
+            "quantity": qty,
+            "realised_pnl": round(realised, 2),
+            "unrealised_pnl": round(unrealised, 2),
+            "pnl": round(position_pnl, 2),
+        })
+        if seg == "FNO":
+            fno_pnl += position_pnl
+        else:
+            intraday_pnl += position_pnl
+
     return {
         "total_capital": round(total_capital, 2),
         "available_cash": round(available_cash, 2),
@@ -187,4 +245,7 @@ async def get_live_summary(
         "total_pnl_pct": round(total_pnl_pct, 2),
         "holdings_count": len(holdings_list),
         "holdings": holdings_list,
+        "intraday_pnl": round(intraday_pnl, 2),
+        "fno_pnl": round(fno_pnl, 2),
+        "positions": positions_list,
     }
