@@ -66,6 +66,11 @@ def _fetch_candles_paginated(groww, trading_symbol, exchange, segment, start_dt:
     return unique
 
 
+# ── LTP cache: per (user_id, symbol), ttl = 1s ─────────────────────────────
+_ltp_cache: dict[str, tuple[float, float]] = {}  # key → (ltp, fetched_at)
+_LTP_TTL = 1.0  # seconds
+
+
 INSTRUMENTS: dict = {}
 
 def _build_instruments():
@@ -407,9 +412,19 @@ async def get_quote(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
+    import time as _time
     instr = INSTRUMENTS.get(symbol)
     if not instr:
         raise HTTPException(status_code=400, detail=f"Unknown instrument: {symbol}")
+
+    cache_key = f"{current_user.id}:{symbol}"
+    now_ts = _time.monotonic()
+
+    # Serve cached value if still fresh
+    if cache_key in _ltp_cache:
+        cached_ltp, fetched_at = _ltp_cache[cache_key]
+        if now_ts - fetched_at < _LTP_TTL:
+            return {"symbol": symbol, "ltp": cached_ltp, "timestamp": int(datetime.now().timestamp()), "cached": True}
 
     groww = await _get_groww(current_user, db)
 
@@ -430,8 +445,10 @@ async def get_quote(
                 sys.stdout, sys.stderr = _o, _e
 
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, _fetch)
-        return {"symbol": symbol, "ltp": data, "timestamp": int(datetime.now().timestamp())}
+        ltp = await loop.run_in_executor(None, _fetch)
+        if ltp is not None:
+            _ltp_cache[cache_key] = (ltp, _time.monotonic())
+        return {"symbol": symbol, "ltp": ltp, "timestamp": int(datetime.now().timestamp()), "cached": False}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Groww API error: {e}")
 
