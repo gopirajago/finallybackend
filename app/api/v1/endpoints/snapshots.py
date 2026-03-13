@@ -1,4 +1,4 @@
-"""Snapshot endpoints – serve stored portfolio history to the dashboard."""
+"""Snapshot endpoints - serve stored portfolio history to the dashboard."""
 
 from datetime import date
 from typing import Annotated, Any
