@@ -14,9 +14,11 @@ from app.models.user import User
 from app.models.strategy_signal import StrategySignal, StrategyTrade, StrategyConfig
 from app.services.skew_hunter import SkewHunterStrategy
 from pydantic import BaseModel, Field
+from app.api.v1.endpoints import strategy_auto
 
 
 router = APIRouter()
+router.include_router(strategy_auto.router, prefix="/auto", tags=["strategy-automation"])
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────

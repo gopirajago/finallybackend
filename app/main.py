@@ -7,16 +7,20 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.scheduler import start_scheduler, stop_scheduler
+from app.services.strategy_scheduler import strategy_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_scheduler()
+    strategy_scheduler.start()
     yield
+    strategy_scheduler.stop()
     stop_scheduler()
 
 

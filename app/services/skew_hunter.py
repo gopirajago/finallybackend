@@ -136,69 +136,62 @@ class SkewHunterStrategy:
         otm_put_iv = otm_put.get('iv', 0)
         itm_put_iv = itm_put.get('iv', 0)
         
-        # Calculate alphas
-        alpha1 = self.calculate_alpha1(
-            otm_call_volume_ratio,
-            itm_put_volume_ratio,
-            otm_call_oi_change,
-            itm_put_oi_change
-        )
+        call_iv_skew = 0
+        put_iv_skew = 0
         
-        alpha2 = self.calculate_alpha2(
-            otm_call_iv,
-            itm_call_iv,
-            otm_put_iv,
-            itm_put_iv
-        )
+        if itm_call_iv > 0:
+            call_iv_skew = otm_call_iv / itm_call_iv
+            
+        if itm_put_iv > 0:
+            put_iv_skew = otm_put_iv / itm_put_iv
         
-        # Determine signal type
-        signal_type = None
-        selected_option = None
+        # Calculate Alpha1 (volume-based)
+        alpha1 = call_volume_ratio - put_volume_ratio  # Range: -1 to 1
         
-        # Long Call Signal: alpha1 > 0.75 AND alpha2 > 0.8
-        if alpha1 > self.alpha1_long_call_threshold and alpha2 > self.alpha2_long_call_threshold:
+        # Calculate Alpha2 (IV skew-based)
+        alpha2 = call_iv_skew - put_iv_skew  # Positive = calls expensive, negative = puts expensive
+        
+        # Determine signal type based on thresholds
+        signal_type = "NEUTRAL"
+        signal_strength = 0.0
+        recommended_strike = data.get("atm_strike", 0)
+        recommended_option_type = "CE"
+        recommended_entry_price = 0
+        
+        if (alpha1 >= config.alpha1_long_call_threshold and 
+            alpha2 >= config.alpha2_long_call_threshold):
             signal_type = "LONG_CALL"
-            selected_option = otm_call
-            option_type = "CE"
-        
-        # Long Put Signal: alpha1 < 0.25 AND alpha2 < 0.2
-        elif alpha1 < self.alpha1_long_put_threshold and alpha2 < self.alpha2_long_put_threshold:
+            signal_strength = (alpha1 + alpha2) / 2
+            recommended_strike = otm_call.get("strike", recommended_strike)
+            recommended_option_type = "CE"
+            recommended_entry_price = otm_call.get("price", 0)
+            
+        elif (alpha1 <= config.alpha1_long_put_threshold and 
+              alpha2 <= config.alpha2_long_put_threshold):
             signal_type = "LONG_PUT"
-            selected_option = otm_put
-            option_type = "PE"
+            signal_strength = (abs(alpha1) + abs(alpha2)) / 2
+            recommended_strike = otm_put.get("strike", recommended_strike)
+            recommended_option_type = "PE"
+            recommended_entry_price = otm_put.get("price", 0)
         
-        # No signal if conditions not met
-        if not signal_type or not selected_option:
-            return None
-        
-        # Check minimum option price
-        option_price = selected_option.get('ltp', 0)
-        if option_price < self.min_option_price:
-            return None
-        
-        # Calculate signal strength
-        signal_strength = (alpha1 + alpha2) / 2
+        # Calculate stop loss
+        stop_loss_price = self.calculate_stop_loss(
+            recommended_entry_price,
+            config.stop_loss_percent
+        )
         
         return {
-            'signal_type': signal_type,
-            'alpha1': alpha1,
-            'alpha2': alpha2,
-            'signal_strength': signal_strength,
-            'strike_price': selected_option.get('strike'),
-            'option_type': option_type,
-            'option_price': option_price,
-            'spot_price': spot_price,
-            'atm_strike': atm_strike,
-            'metrics': {
-                'otm_call_volume_ratio': otm_call_volume_ratio,
-                'itm_put_volume_ratio': itm_put_volume_ratio,
-                'otm_call_oi_change': otm_call_oi_change,
-                'itm_put_oi_change': itm_put_oi_change,
-                'otm_call_iv': otm_call_iv,
-                'itm_call_iv': itm_call_iv,
-                'otm_put_iv': otm_put_iv,
-                'itm_put_iv': itm_put_iv,
-            }
+            "symbol": data.get("symbol", ""),
+            "signal_type": signal_type,
+            "signal_strength": signal_strength,
+            "alpha1": alpha1,
+            "alpha2": alpha2,
+            "spot_price": data.get("spot_price", 0),
+            "recommended_strike": recommended_strike,
+            "recommended_option_type": recommended_option_type,
+            "recommended_entry_price": recommended_entry_price,
+            "stop_loss_price": stop_loss_price,
+            "expiry_date": data.get("expiry_date"),
         }
     
     def calculate_stop_loss(self, entry_price: float) -> float:
