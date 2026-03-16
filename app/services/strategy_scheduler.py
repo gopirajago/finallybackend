@@ -14,18 +14,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import AsyncSessionLocal
 from app.models.strategy_signal import StrategyConfig
 from app.models.user import User
-from app.services.skew_hunter import SkewHunterStrategy
+from app.services.strategies import StrategyFactory, StrategyType
 from app.services.strategy_data_fetcher import StrategyDataFetcher
+from app.services.market_data_service import MarketDataService
 
 logger = logging.getLogger(__name__)
 
 
 class StrategyScheduler:
-    """Manages automated strategy execution"""
+    """Manages automated strategy execution with multi-strategy support"""
     
     def __init__(self):
         self.scheduler = AsyncIOScheduler()
-        self.strategy = SkewHunterStrategy()
         self.is_running = False
         
     def start(self):
@@ -92,7 +92,7 @@ class StrategyScheduler:
             logger.error(f"Error in strategy scan: {e}", exc_info=True)
             
     async def process_strategy(self, db: AsyncSession, config: StrategyConfig, user: User):
-        """Process a single strategy configuration"""
+        """Process strategy configuration with multi-strategy support"""
         # Check if we're within trading hours
         now = datetime.now()
         current_time = now.time()
@@ -104,13 +104,17 @@ class StrategyScheduler:
             logger.debug(f"Outside trading hours for user {user.id}")
             return
             
-        logger.info(f"Processing strategy for user {user.id} - symbols: {config.symbols}")
+        logger.info(f"Processing strategies for user {user.id} - symbols: {config.symbols}")
         
         # Fetch data and generate signals for each symbol
         data_fetcher = StrategyDataFetcher(user, db)
+        market_data_service = MarketDataService()
         
         for symbol in config.symbols:
             try:
+                # Get market regime data
+                market_regime_data = await market_data_service.get_market_regime_data(symbol)
+                
                 # Fetch options data from Groww
                 options_data = await data_fetcher.fetch_options_data(symbol)
                 
@@ -118,18 +122,46 @@ class StrategyScheduler:
                     logger.warning(f"No options data for {symbol}")
                     continue
                 
-                # Generate signal using the strategy
-                signal_result = self.strategy.generate_signal(options_data, config)
+                # Add market regime data to options data
+                options_data.update(market_regime_data)
                 
-                if signal_result['signal_type'] != 'NEUTRAL':
-                    logger.info(f"Signal generated for {symbol}: {signal_result['signal_type']}")
+                # Get enabled strategies for this config
+                enabled_strategies = config.enabled_strategies or ["skew_hunter"]
+                
+                # Process each enabled strategy
+                for strategy_type_str in enabled_strategies:
+                    try:
+                        # Create strategy instance
+                        strategy_type = StrategyType(strategy_type_str)
+                        strategy = StrategyFactory.create_strategy(strategy_type, {
+                            'alpha1_long_call_threshold': config.alpha1_long_call_threshold,
+                            'alpha2_long_call_threshold': config.alpha2_long_call_threshold,
+                            'alpha1_long_put_threshold': config.alpha1_long_put_threshold,
+                            'alpha2_long_put_threshold': config.alpha2_long_put_threshold,
+                            'stop_loss_percent': config.stop_loss_percent,
+                        })
+                        
+                        # Generate signal
+                        signal_result = strategy.generate_signal(options_data, config)
+                        
+                        if signal_result.get('signal_type') != 'NEUTRAL':
+                            logger.info(f"{strategy_type_str} signal for {symbol}: {signal_result['signal_type']}")
+                            
+                            # Add strategy type to signal
+                            signal_result['strategy_type'] = strategy_type_str
+                            signal_result['strategy_name'] = strategy.name
+                            
+                            # Save signal to database
+                            await data_fetcher.save_signal(signal_result, config)
+                            
+                            # Send notification if enabled
+                            if config.send_signal_alerts:
+                                await self.send_notification(user, signal_result)
                     
-                    # Save signal to database
-                    await data_fetcher.save_signal(signal_result, config)
-                    
-                    # Send notification if enabled
-                    if config.send_signal_alerts:
-                        await self.send_notification(user, signal_result)
+                    except ValueError as e:
+                        logger.error(f"Invalid strategy type {strategy_type_str}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error processing {strategy_type_str} for {symbol}: {e}", exc_info=True)
                         
             except Exception as e:
                 logger.error(f"Error processing {symbol} for user {user.id}: {e}", exc_info=True)

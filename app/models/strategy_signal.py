@@ -117,9 +117,14 @@ class StrategyConfig(Base):
     
     # Strategy settings
     strategy_name = Column(String, default="Skew Hunter", nullable=False)
+    strategy_type = Column(String, default="skew_hunter", nullable=False)  # Strategy type from StrategyType enum
     is_enabled = Column(Boolean, default=False)
     version = Column(String, default="regular")  # "regular" or "tsl"
     symbols = Column(JSON, default=["NIFTY", "SENSEX"])  # List of symbols to monitor
+    
+    # Multi-strategy support
+    enabled_strategies = Column(JSON, default=["skew_hunter"])  # List of enabled strategy types
+    strategy_allocation = Column(JSON, default={"skew_hunter": 100})  # Capital allocation % per strategy
     
     # Trading hours
     start_time = Column(String, default="10:15")  # HH:MM format
