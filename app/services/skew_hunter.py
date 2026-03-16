@@ -14,14 +14,14 @@ class SkewHunterStrategy:
     to identify trading opportunities based on volatility skew and volume/OI patterns
     """
     
-    def __init__(self, config: Dict):
-        self.config = config
-        self.alpha1_long_call_threshold = config.get('alpha1_long_call_threshold', 0.75)
-        self.alpha2_long_call_threshold = config.get('alpha2_long_call_threshold', 0.8)
-        self.alpha1_long_put_threshold = config.get('alpha1_long_put_threshold', 0.25)
-        self.alpha2_long_put_threshold = config.get('alpha2_long_put_threshold', 0.2)
-        self.min_option_price = config.get('min_option_price', 20.0)
-        self.stop_loss_percent = config.get('stop_loss_percent', 40.0)
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.alpha1_long_call_threshold = self.config.get('alpha1_long_call_threshold', 0.75)
+        self.alpha2_long_call_threshold = self.config.get('alpha2_long_call_threshold', 0.8)
+        self.alpha1_long_put_threshold = self.config.get('alpha1_long_put_threshold', 0.25)
+        self.alpha2_long_put_threshold = self.config.get('alpha2_long_put_threshold', 0.2)
+        self.min_option_price = self.config.get('min_option_price', 20.0)
+        self.stop_loss_percent = self.config.get('stop_loss_percent', 40.0)
         
     def is_trading_hours(self, current_time: datetime) -> bool:
         """Check if current time is within trading hours (10:15 AM - 2:15 PM)"""
