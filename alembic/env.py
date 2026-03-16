@@ -38,13 +38,17 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
     url = config.get_main_option("sqlalchemy.url")
-    # Add SSL disable for local PostgreSQL
-    if "sslmode" not in url:
-        url = url + ("&" if "?" in url else "?") + "sslmode=disable"
+    
+    # Determine SSL mode based on environment
+    # Heroku/production databases require SSL, local development doesn't
+    if "localhost" in url or "127.0.0.1" in url:
+        ssl_mode = "disable"
+    else:
+        ssl_mode = "require"
     
     connectable = create_engine(
         url,
-        connect_args={"sslmode": "disable"},
+        connect_args={"sslmode": ssl_mode},
     )
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
