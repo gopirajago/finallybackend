@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from app.models.broker_settings import BrokerSettings
     from app.models.portfolio_snapshot import PortfolioSnapshot
     from app.models.claude_settings import ClaudeSettings
+    from app.models.strategy_signal import StrategySignal, StrategyTrade, StrategyConfig
 
 
 class User(Base):
@@ -50,4 +51,16 @@ class User(Base):
 
     claude_settings: Mapped[ClaudeSettings | None] = relationship(
         "ClaudeSettings", back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+
+    strategy_signals: Mapped[list[StrategySignal]] = relationship(
+        "StrategySignal", back_populates="user", cascade="all, delete-orphan"
+    )
+
+    strategy_trades: Mapped[list[StrategyTrade]] = relationship(
+        "StrategyTrade", back_populates="user", cascade="all, delete-orphan"
+    )
+
+    strategy_config: Mapped[StrategyConfig | None] = relationship(
+        "StrategyConfig", back_populates="user", uselist=False, cascade="all, delete-orphan"
     )

@@ -36,9 +36,15 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+    url = config.get_main_option("sqlalchemy.url")
+    # Add SSL disable for local PostgreSQL
+    if "sslmode" not in url:
+        url = url + ("&" if "?" in url else "?") + "sslmode=disable"
+    
     connectable = create_engine(
-        _sync_url,
-        connect_args={"sslmode": "require"},
+        url,
+        connect_args={"sslmode": "disable"},
     )
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
