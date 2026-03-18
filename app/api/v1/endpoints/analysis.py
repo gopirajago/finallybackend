@@ -757,6 +757,183 @@ def _analyze_strategies(candles: list[list], current_price: float) -> dict:
                     f"Strong {direction.lower()} candle with volume spike ({int(vols[last]/avg_vol*100)}% of avg)",
                     strength="High", confluence=3))
 
+    # ── 17. Trend Following (ADX-proxy: consistent EMA slope) ────────────
+    # Strong trend = EMA9 > EMA21 > EMA50 (bull) or EMA9 < EMA21 < EMA50 (bear)
+    # with RSI in momentum zone (45-70 bull, 30-55 bear) — ride the trend
+    if ema9[last] and ema21[last] and ema50[last] and rsi14[last]:
+        rsi_val = rsi14[last]
+        bull_stack = ema9[last] > ema21[last] > ema50[last]
+        bear_stack = ema9[last] < ema21[last] < ema50[last]
+        # Measure slope: EMA21 rising/falling over last 5 bars
+        slope_period = min(5, last)
+        ema21_slope = (ema21[last] - ema21[last - slope_period]) / slope_period if ema21[last - slope_period] else 0
+        slope_pct = abs(ema21_slope) / current_price * 100
+
+        if bull_stack and 45 <= rsi_val <= 75 and slope_pct > 0.01:
+            c = 2 + (1 if vol_spike else 0) + (1 if st_dir[last] == 1 else 0)
+            signals.append(_sig("Trend Following", "LONG",
+                current_price,
+                ema21[last] - atr * 0.5,
+                current_price + 3 * atr,
+                f"Bull stack EMA9>21>50 · RSI={rsi_val:.0f} momentum · slope {slope_pct:.3f}%/bar",
+                strength="High", confluence=c))
+        elif bear_stack and 25 <= rsi_val <= 55 and slope_pct > 0.01:
+            c = 2 + (1 if vol_spike else 0) + (1 if st_dir[last] == -1 else 0)
+            signals.append(_sig("Trend Following", "SHORT",
+                current_price,
+                ema21[last] + atr * 0.5,
+                current_price - 3 * atr,
+                f"Bear stack EMA9<21<50 · RSI={rsi_val:.0f} momentum · slope {slope_pct:.3f}%/bar",
+                strength="High", confluence=c))
+
+    # ── 18. Range / Sideways Mean Reversion ──────────────────────────────
+    # Detect sideways: EMA21 slope near flat + BB narrow width
+    # Buy at lower BB + RSI < 40; Sell at upper BB + RSI > 60
+    if bb_up[last] and bb_lo[last] and bb_mid[last] and ema21[last]:
+        band_width = (bb_up[last] - bb_lo[last]) / bb_mid[last]
+        slope_5 = abs(ema21[last] - ema21[last - 5]) / current_price * 100 if last >= 5 and ema21[last-5] else 1.0
+        is_ranging = band_width < 0.04 and slope_5 < 0.05  # flat EMA + narrow bands
+
+        if is_ranging and rsi14[last]:
+            rsi_val = rsi14[last]
+            if current_price < bb_mid[last] and rsi_val < 45:
+                # Price in lower half of range — LONG back to midline
+                c = 2 + (1 if stoch_k[last] and stoch_k[last] < 30 else 0) + (1 if rsi_val < 35 else 0)
+                signals.append(_sig("Range Mean Reversion", "LONG",
+                    current_price,
+                    bb_lo[last] - atr * 0.3,
+                    bb_mid[last],
+                    f"Ranging market (BB width {band_width:.2%}) · price below midline · RSI={rsi_val:.0f}",
+                    strength="High", confluence=c))
+            elif current_price > bb_mid[last] and rsi_val > 55:
+                # Price in upper half of range — SHORT back to midline
+                c = 2 + (1 if stoch_k[last] and stoch_k[last] > 70 else 0) + (1 if rsi_val > 65 else 0)
+                signals.append(_sig("Range Mean Reversion", "SHORT",
+                    current_price,
+                    bb_up[last] + atr * 0.3,
+                    bb_mid[last],
+                    f"Ranging market (BB width {band_width:.2%}) · price above midline · RSI={rsi_val:.0f}",
+                    strength="High", confluence=c))
+
+    # ── 19. Opening Range Breakout (ORB) ─────────────────────────────────
+    # First 15 minutes of market (9:15–9:30 IST) form the Opening Range.
+    # Break above ORH → LONG; break below ORL → SHORT with volume confirmation.
+    # ORB is most relevant for 1m, 3m, 5m intervals.
+    if interval <= 15 and len(candles) >= 3:
+        IST_OFFSET_S = 19800  # 5h30m
+        MARKET_OPEN_S = 9 * 3600 + 15 * 60  # 09:15 IST = 33300s into day
+        ORB_END_S    = 9 * 3600 + 30 * 60   # 09:30 IST = 34200s
+
+        # Collect candles in opening range window (09:15–09:30 IST)
+        orb_candles = []
+        for c_raw in candles:
+            ts_ist = c_raw[0] + IST_OFFSET_S
+            secs_in_day = ts_ist % 86400
+            if MARKET_OPEN_S <= secs_in_day < ORB_END_S:
+                orb_candles.append(c_raw)
+
+        if orb_candles:
+            orb_high = max(c[2] for c in orb_candles)
+            orb_low  = min(c[3] for c in orb_candles)
+            orb_range = orb_high - orb_low
+
+            # Current close breaks out of ORB with volume
+            if closes[last] > orb_high and vol_spike:
+                c = 2 + (1 if trend_bias == "bullish" else 0) + (1 if vwap_line[last] and current_price > vwap_line[last] else 0)
+                signals.append(_sig("ORB Breakout", "LONG",
+                    current_price,
+                    orb_high - orb_range * 0.3,          # SL just below ORH
+                    current_price + orb_range * 2,        # TP = 2× ORB range
+                    f"Opening Range Breakout above {orb_high:.0f} · ORB range={orb_range:.0f} pts",
+                    strength="High", confluence=c))
+            elif closes[last] < orb_low and vol_spike:
+                c = 2 + (1 if trend_bias == "bearish" else 0) + (1 if vwap_line[last] and current_price < vwap_line[last] else 0)
+                signals.append(_sig("ORB Breakout", "SHORT",
+                    current_price,
+                    orb_low + orb_range * 0.3,            # SL just above ORL
+                    current_price - orb_range * 2,        # TP = 2× ORB range
+                    f"Opening Range Breakdown below {orb_low:.0f} · ORB range={orb_range:.0f} pts",
+                    strength="High", confluence=c))
+            # ORB Fade: price rejected at ORH/ORL without breakout
+            elif abs(current_price - orb_high) / current_price < 0.001 and rsi14[last] and rsi14[last] > 65:
+                signals.append(_sig("ORB Fade", "SHORT",
+                    current_price,
+                    orb_high + atr * 0.3,
+                    orb_low,
+                    f"ORB fade — price rejected at ORH {orb_high:.0f} · RSI={rsi14[last]:.0f}",
+                    confluence=2))
+            elif abs(current_price - orb_low) / current_price < 0.001 and rsi14[last] and rsi14[last] < 35:
+                signals.append(_sig("ORB Fade", "LONG",
+                    current_price,
+                    orb_low - atr * 0.3,
+                    orb_high,
+                    f"ORB fade — price supported at ORL {orb_low:.0f} · RSI={rsi14[last]:.0f}",
+                    confluence=2))
+
+    # ── 20. VWAP Strategy Suite ───────────────────────────────────────────
+    # Four VWAP sub-setups:
+    #  A. VWAP Reclaim (price dips below VWAP, reclaims it) → LONG
+    #  B. VWAP Rejection (price spikes above VWAP, fails) → SHORT
+    #  C. VWAP Trend Continuation (price bounces off VWAP in direction of trend) → trend direction
+    #  D. VWAP + S/R Confluence (VWAP near a key S/R level)
+    if vwap_line[last] and vwap_line[prev]:
+        vwap_now  = vwap_line[last]
+        vwap_prev = vwap_line[prev]
+
+        # A. VWAP Reclaim: prev close below VWAP, current close above VWAP with volume
+        if closes[prev] < vwap_prev and closes[last] > vwap_now and vol_spike:
+            c = 3 + (1 if trend_bias == "bullish" else 0)
+            signals.append(_sig("VWAP Reclaim", "LONG",
+                current_price,
+                vwap_now - atr * 0.5,
+                current_price + 2.5 * atr,
+                f"Price reclaimed VWAP ({vwap_now:.0f}) with volume — institutional buyers active",
+                strength="High", confluence=c))
+
+        # B. VWAP Rejection: prev close above VWAP, current close below VWAP with volume
+        elif closes[prev] > vwap_prev and closes[last] < vwap_now and vol_spike:
+            c = 3 + (1 if trend_bias == "bearish" else 0)
+            signals.append(_sig("VWAP Rejection", "SHORT",
+                current_price,
+                vwap_now + atr * 0.5,
+                current_price - 2.5 * atr,
+                f"Price rejected below VWAP ({vwap_now:.0f}) with volume — institutional sellers active",
+                strength="High", confluence=c))
+
+        # C. VWAP Trend Bounce: price pulls back to VWAP and bounces in trend direction
+        vwap_dist_pct = abs(current_price - vwap_now) / current_price * 100
+        if vwap_dist_pct < 0.15:  # within 0.15% of VWAP
+            if trend_bias == "bullish" and closes[last] >= vwap_now and closes[prev] < vwap_prev:
+                c = 2 + (1 if st_dir[last] == 1 else 0) + (1 if rsi14[last] and 40 < rsi14[last] < 65 else 0)
+                signals.append(_sig("VWAP Trend Bounce", "LONG",
+                    current_price,
+                    vwap_now - atr * 0.4,
+                    current_price + 2 * atr,
+                    f"Bullish bounce off VWAP ({vwap_now:.0f}) in uptrend — high-probability long",
+                    confluence=c))
+            elif trend_bias == "bearish" and closes[last] <= vwap_now and closes[prev] > vwap_prev:
+                c = 2 + (1 if st_dir[last] == -1 else 0) + (1 if rsi14[last] and 35 < rsi14[last] < 60 else 0)
+                signals.append(_sig("VWAP Trend Bounce", "SHORT",
+                    current_price,
+                    vwap_now + atr * 0.4,
+                    current_price - 2 * atr,
+                    f"Bearish bounce off VWAP ({vwap_now:.0f}) in downtrend — high-probability short",
+                    confluence=c))
+
+        # D. VWAP + S/R Confluence: VWAP sits on top of a key S/R level
+        for lvl in sr_levels:
+            vwap_sr_dist = abs(vwap_now - lvl) / lvl * 100
+            price_sr_dist = abs(current_price - lvl) / current_price * 100
+            if vwap_sr_dist < 0.2 and price_sr_dist < 0.3:
+                direction = "LONG" if current_price >= lvl else "SHORT"
+                signals.append(_sig("VWAP+S/R Confluence", direction,
+                    current_price,
+                    lvl - atr if direction == "LONG" else lvl + atr,
+                    current_price + 2.5 * atr if direction == "LONG" else current_price - 2.5 * atr,
+                    f"VWAP {vwap_now:.0f} confluent with S/R {lvl:.0f} — double magnet level",
+                    strength="High", confluence=3))
+                break  # only the nearest confluence
+
     # ── De-duplicate: keep highest-confluence signal per strategy ─────────
     seen: dict = {}
     for s in signals:
