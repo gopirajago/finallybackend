@@ -201,155 +201,608 @@ def _find_liquidity_sweeps(candles: list[list]) -> list[dict]:
     return sweeps[-5:] if len(sweeps) > 5 else sweeps
 
 
-def _analyze_strategies(candles: list[list], current_price: float) -> dict:
-    """Run all strategies and return signals with Entry/SL/TP."""
-    if len(candles) < 20:
-        return {"signals": [], "indicators": {}}
+def _bollinger_bands(closes: list[float], period: int = 20, std_dev: float = 2.0):
+    """Returns (upper, mid, lower) lists."""
+    upper, mid, lower = [], [], []
+    for i in range(len(closes)):
+        if i < period - 1:
+            upper.append(None); mid.append(None); lower.append(None)
+        else:
+            window = closes[i - period + 1: i + 1]
+            m = sum(window) / period
+            sd = (sum((x - m) ** 2 for x in window) / period) ** 0.5
+            upper.append(round(m + std_dev * sd, 2))
+            mid.append(round(m, 2))
+            lower.append(round(m - std_dev * sd, 2))
+    return upper, mid, lower
 
+
+def _macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9):
+    """Returns (macd_line, signal_line, histogram) lists."""
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    macd_line = [
+        round(f - s, 4) if f is not None and s is not None else None
+        for f, s in zip(ema_fast, ema_slow)
+    ]
+    valid_macd = [v for v in macd_line if v is not None]
+    if len(valid_macd) < signal:
+        sig_line = [None] * len(macd_line)
+    else:
+        sig_raw = _ema(valid_macd, signal)
+        # Pad signal line to align with macd_line
+        offset = len(macd_line) - len(valid_macd)
+        sig_line = [None] * offset + sig_raw
+    histogram = [
+        round(m - s, 4) if m is not None and s is not None else None
+        for m, s in zip(macd_line, sig_line)
+    ]
+    return macd_line, sig_line, histogram
+
+
+def _stochastic_rsi(closes: list[float], rsi_period: int = 14, stoch_period: int = 14):
+    """Returns (stoch_k, stoch_d) 0-100 smoothed lists."""
+    rsi = _rsi(closes, rsi_period)
+    k_line, d_line = [], []
+    for i in range(len(rsi)):
+        window = [r for r in rsi[max(0, i - stoch_period + 1): i + 1] if r is not None]
+        if len(window) < stoch_period or rsi[i] is None:
+            k_line.append(None)
+        else:
+            lo, hi = min(window), max(window)
+            k_line.append(round(100 * (rsi[i] - lo) / (hi - lo), 2) if hi != lo else 50.0)
+    # Smooth %D as 3-period SMA of %K
+    for i in range(len(k_line)):
+        vals = [k_line[j] for j in range(max(0, i-2), i+1) if k_line[j] is not None]
+        d_line.append(round(sum(vals) / len(vals), 2) if vals else None)
+    return k_line, d_line
+
+
+def _vwap(candles: list[list]) -> list[float | None]:
+    """Intraday VWAP — resets each session."""
+    result = []
+    cum_pv = cum_v = 0.0
+    for c in candles:
+        t, o, h, l, cl, v = c[0], c[1], c[2], c[3], c[4], c[5] if len(c) > 5 else 0
+        typ = (h + l + cl) / 3
+        cum_pv += typ * v
+        cum_v  += v
+        result.append(round(cum_pv / cum_v, 2) if cum_v else None)
+    return result
+
+
+def _supertrend(candles: list[list], period: int = 10, multiplier: float = 3.0):
+    """Returns (supertrend_line, direction) where direction 1=bullish, -1=bearish."""
+    if len(candles) < period:
+        return [None]*len(candles), [0]*len(candles)
+    highs  = [c[2] for c in candles]
+    lows   = [c[3] for c in candles]
     closes = [c[4] for c in candles]
+    # ATR
+    tr = [highs[0] - lows[0]]
+    for i in range(1, len(candles)):
+        tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])))
+    atr_vals = [None] * (period - 1)
+    atr_sum = sum(tr[:period])
+    atr_vals.append(atr_sum / period)
+    for i in range(period, len(tr)):
+        atr_vals.append((atr_vals[-1] * (period - 1) + tr[i]) / period)  # type: ignore[operator]
+
+    st_line = [None] * len(candles)
+    direction = [0] * len(candles)
+    upper_band = [None] * len(candles)
+    lower_band = [None] * len(candles)
+
+    for i in range(period - 1, len(candles)):
+        mid = (highs[i] + lows[i]) / 2
+        upper_band[i] = round(mid + multiplier * atr_vals[i], 2)  # type: ignore[operator]
+        lower_band[i] = round(mid - multiplier * atr_vals[i], 2)  # type: ignore[operator]
+
+    prev_st = lower_band[period - 1]
+    prev_dir = 1
+    for i in range(period - 1, len(candles)):
+        if upper_band[i] is None:
+            continue
+        if prev_dir == 1:
+            curr_st = max(lower_band[i], prev_st) if prev_st else lower_band[i]  # type: ignore[operator]
+            if closes[i] < curr_st:  # type: ignore[operator]
+                curr_dir = -1
+                curr_st = upper_band[i]
+            else:
+                curr_dir = 1
+        else:
+            curr_st = min(upper_band[i], prev_st) if prev_st else upper_band[i]  # type: ignore[operator]
+            if closes[i] > curr_st:  # type: ignore[operator]
+                curr_dir = 1
+                curr_st = lower_band[i]
+            else:
+                curr_dir = -1
+        st_line[i] = curr_st
+        direction[i] = curr_dir
+        prev_st = curr_st
+        prev_dir = curr_dir
+    return st_line, direction
+
+
+def _candlestick_patterns(candles: list[list]) -> list[dict]:
+    """Detect high-probability candlestick patterns."""
+    patterns = []
+    if len(candles) < 3:
+        return patterns
+
+    for i in range(2, len(candles)):
+        c0, c1, c2 = candles[i-2], candles[i-1], candles[i]
+        o0,h0,l0,cl0 = c0[1],c0[2],c0[3],c0[4]
+        o1,h1,l1,cl1 = c1[1],c1[2],c1[3],c1[4]
+        o2,h2,l2,cl2 = c2[1],c2[2],c2[3],c2[4]
+        body0 = abs(cl0 - o0); body1 = abs(cl1 - o1); body2 = abs(cl2 - o2)
+        range1 = h1 - l1 if h1 != l1 else 0.0001
+        upper_wick1 = h1 - max(o1, cl1)
+        lower_wick1 = min(o1, cl1) - l1
+
+        # Bullish Engulfing
+        if cl0 < o0 and cl2 > o2 and o2 <= cl0 and cl2 >= o0:
+            patterns.append({"type": "Bullish Engulfing", "direction": "LONG", "strength": "High", "candle_idx": i})
+
+        # Bearish Engulfing
+        if cl0 > o0 and cl2 < o2 and o2 >= cl0 and cl2 <= o0:
+            patterns.append({"type": "Bearish Engulfing", "direction": "SHORT", "strength": "High", "candle_idx": i})
+
+        # Hammer (bullish reversal after downtrend)
+        if (lower_wick1 >= 2 * body1 and upper_wick1 <= 0.1 * range1
+                and body1 > 0 and cl1 > o1):
+            patterns.append({"type": "Hammer", "direction": "LONG", "strength": "Medium", "candle_idx": i-1})
+
+        # Shooting Star (bearish reversal after uptrend)
+        if (upper_wick1 >= 2 * body1 and lower_wick1 <= 0.1 * range1
+                and body1 > 0 and cl1 < o1):
+            patterns.append({"type": "Shooting Star", "direction": "SHORT", "strength": "Medium", "candle_idx": i-1})
+
+        # Doji (indecision — direction from context)
+        if body1 <= 0.05 * range1 and range1 > 0:
+            patterns.append({"type": "Doji", "direction": "NEUTRAL", "strength": "Low", "candle_idx": i-1})
+
+        # Morning Star (3-candle bullish reversal)
+        if (cl0 < o0 and body1 <= 0.3 * body0  # small middle candle
+                and cl2 > o2 and cl2 > (o0 + cl0) / 2):
+            patterns.append({"type": "Morning Star", "direction": "LONG", "strength": "High", "candle_idx": i})
+
+        # Evening Star (3-candle bearish reversal)
+        if (cl0 > o0 and body1 <= 0.3 * body0
+                and cl2 < o2 and cl2 < (o0 + cl0) / 2):
+            patterns.append({"type": "Evening Star", "direction": "SHORT", "strength": "High", "candle_idx": i})
+
+        # Bullish Pin Bar (long lower wick)
+        if (lower_wick1 >= 2.5 * body1 and lower_wick1 >= 0.6 * range1):
+            patterns.append({"type": "Bullish Pin Bar", "direction": "LONG", "strength": "High", "candle_idx": i-1})
+
+        # Bearish Pin Bar (long upper wick)
+        if (upper_wick1 >= 2.5 * body1 and upper_wick1 >= 0.6 * range1):
+            patterns.append({"type": "Bearish Pin Bar", "direction": "SHORT", "strength": "High", "candle_idx": i-1})
+
+    # Return last 10 unique patterns
+    seen = set()
+    unique = []
+    for p in reversed(patterns):
+        key = (p["type"], p["candle_idx"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+        if len(unique) == 10:
+            break
+    return list(reversed(unique))
+
+
+def _find_order_blocks(candles: list[list]) -> list[dict]:
+    """Order blocks: last strong impulsive candle before a BOS move."""
+    blocks = []
+    if len(candles) < 5:
+        return blocks
+    closes = [c[4] for c in candles]
+    opens  = [c[1] for c in candles]
     highs  = [c[2] for c in candles]
     lows   = [c[3] for c in candles]
 
-    ema9  = _ema(closes, 9)
-    ema21 = _ema(closes, 21)
-    ema50 = _ema(closes, 50)
-    rsi14 = _rsi(closes, 14)
-    sr_levels = _find_sr_levels(candles)
-    fvgs = _find_fvg(candles)
-    sweeps = _find_liquidity_sweeps(candles)
+    for i in range(3, len(candles) - 2):
+        body = abs(closes[i] - opens[i])
+        rng  = highs[i] - lows[i]
+        if rng == 0:
+            continue
+        # Strong bullish candle followed by move up — bullish OB
+        if closes[i] > opens[i] and body / rng > 0.6:
+            # Subsequent candle breaks above this candle's high
+            if highs[i+1] > highs[i] and closes[i+1] > highs[i]:
+                blocks.append({"type": "bullish", "top": highs[i], "bottom": lows[i], "time": candles[i][0]})
+        # Strong bearish candle followed by move down — bearish OB
+        elif closes[i] < opens[i] and body / rng > 0.6:
+            if lows[i+1] < lows[i] and closes[i+1] < lows[i]:
+                blocks.append({"type": "bearish", "top": highs[i], "bottom": lows[i], "time": candles[i][0]})
+
+    return blocks[-6:] if len(blocks) > 6 else blocks
+
+
+def _find_bos_choch(candles: list[list]) -> list[dict]:
+    """Break of Structure (BOS) and Change of Character (ChoCh) detection."""
+    events = []
+    if len(candles) < 10:
+        return events
+    highs  = [c[2] for c in candles]
+    lows   = [c[3] for c in candles]
+    closes = [c[4] for c in candles]
+
+    # Track swing highs and lows
+    swing_highs = []
+    swing_lows  = []
+    for i in range(2, len(candles) - 2):
+        if highs[i] == max(highs[i-2:i+3]):
+            swing_highs.append((i, highs[i]))
+        if lows[i] == min(lows[i-2:i+3]):
+            swing_lows.append((i, lows[i]))
+
+    # BOS Long: close breaks above last swing high
+    if swing_highs:
+        last_sh_idx, last_sh_val = swing_highs[-1]
+        for i in range(last_sh_idx + 1, len(candles)):
+            if closes[i] > last_sh_val:
+                events.append({"type": "BOS", "direction": "LONG", "level": round(last_sh_val, 2), "candle_idx": i})
+                break
+
+    # BOS Short: close breaks below last swing low
+    if swing_lows:
+        last_sl_idx, last_sl_val = swing_lows[-1]
+        for i in range(last_sl_idx + 1, len(candles)):
+            if closes[i] < last_sl_val:
+                events.append({"type": "BOS", "direction": "SHORT", "level": round(last_sl_val, 2), "candle_idx": i})
+                break
+
+    # ChoCh: after a BOS long, first lower low = change of character bearish
+    if len(swing_lows) >= 2:
+        last_sl = swing_lows[-1][1]
+        prev_sl = swing_lows[-2][1]
+        if last_sl < prev_sl:  # Lower low = potential ChoCh bearish
+            events.append({"type": "ChoCh", "direction": "SHORT", "level": round(last_sl, 2), "candle_idx": swing_lows[-1][0]})
+        elif last_sl > prev_sl:  # Higher low = potential ChoCh bullish
+            events.append({"type": "ChoCh", "direction": "LONG", "level": round(last_sl, 2), "candle_idx": swing_lows[-1][0]})
+
+    return events[-4:]
+
+
+def _analyze_strategies(candles: list[list], current_price: float) -> dict:
+    """Run all strategies and return signals with Entry/SL/TP + confluence scoring."""
+    if len(candles) < 20:
+        return {"signals": [], "indicators": {}, "patterns": [], "order_blocks": [], "bos_choch": []}
+
+    closes = [c[4] for c in candles]
+    opens  = [c[1] for c in candles]
+    highs  = [c[2] for c in candles]
+    lows   = [c[3] for c in candles]
+    vols   = [c[5] if len(c) > 5 else 0 for c in candles]
+
+    # ── Indicators ────────────────────────────────────────────────────────
+    ema9   = _ema(closes, 9)
+    ema21  = _ema(closes, 21)
+    ema50  = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
+    rsi14  = _rsi(closes, 14)
+    bb_up, bb_mid, bb_lo = _bollinger_bands(closes, 20, 2.0)
+    macd_line, sig_line, histogram = _macd(closes)
+    stoch_k, stoch_d = _stochastic_rsi(closes)
+    vwap_line = _vwap(candles)
+    st_line, st_dir = _supertrend(candles, 10, 3.0)
+
+    # Structural helpers
+    sr_levels  = _find_sr_levels(candles)
+    fvgs       = _find_fvg(candles)
+    sweeps     = _find_liquidity_sweeps(candles)
+    patterns   = _candlestick_patterns(candles)
+    ob_blocks  = _find_order_blocks(candles)
+    bos_choch  = _find_bos_choch(candles)
+
+    last = len(closes) - 1
+    prev = last - 1
+    atr  = sum(highs[i] - lows[i] for i in range(max(0, last-14), last+1)) / 14
+    avg_vol = sum(vols[max(0, last-20):last]) / 20 if vols[last] else 1
+    vol_spike = vols[last] > 1.5 * avg_vol if avg_vol > 0 else False
+
+    trend_bias = "bullish" if (ema50[last] and closes[last] > ema50[last]) else "bearish" if ema50[last] else "neutral"
 
     signals = []
-    last = len(closes) - 1
-    atr = sum(highs[i] - lows[i] for i in range(max(0, last-14), last+1)) / 14
 
-    # ── EMA crossover ──────────────────────────────────────────────────────
-    if ema9[last] and ema21[last] and ema9[last-1] and ema21[last-1]:
-        if ema9[last] > ema21[last] and ema9[last-1] <= ema21[last-1]:
-            signals.append({
-                "strategy": "EMA Crossover",
-                "direction": "LONG",
-                "strength": "Medium",
-                "entry": round(current_price, 2),
-                "sl": round(current_price - 2 * atr, 2),
-                "tp": round(current_price + 3 * atr, 2),
-                "reason": "EMA 9 crossed above EMA 21 — bullish momentum",
-            })
-        elif ema9[last] < ema21[last] and ema9[last-1] >= ema21[last-1]:
-            signals.append({
-                "strategy": "EMA Crossover",
-                "direction": "SHORT",
-                "strength": "Medium",
-                "entry": round(current_price, 2),
-                "sl": round(current_price + 2 * atr, 2),
-                "tp": round(current_price - 3 * atr, 2),
-                "reason": "EMA 9 crossed below EMA 21 — bearish momentum",
-            })
+    def _sig(strategy, direction, entry, sl, tp, reason, strength="Medium", confluence=0):
+        rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 1.0
+        # Boost strength based on confluence count
+        if confluence >= 3:
+            strength = "High"
+        elif confluence == 2 and strength == "Medium":
+            strength = "High"
+        return {
+            "strategy": strategy,
+            "direction": direction,
+            "strength": strength,
+            "entry": round(entry, 2),
+            "sl": round(sl, 2),
+            "tp": round(tp, 2),
+            "reason": reason,
+            "rr": round(rr, 2),
+            "confluence": confluence,
+        }
 
-    # ── RSI extremes ───────────────────────────────────────────────────────
+    # ── 1. EMA Crossover 9/21 ──────────────────────────────────────────────
+    if all(x is not None for x in [ema9[last], ema21[last], ema9[prev], ema21[prev]]):
+        if ema9[last] > ema21[last] and ema9[prev] <= ema21[prev]:
+            c = 1 + (1 if trend_bias == "bullish" else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("EMA 9/21 Crossover", "LONG",
+                current_price, current_price - 2*atr, current_price + 3*atr,
+                f"EMA9 crossed above EMA21 · RSI {rsi14[last]:.0f}" if rsi14[last] else "EMA9 crossed above EMA21",
+                confluence=c))
+        elif ema9[last] < ema21[last] and ema9[prev] >= ema21[prev]:
+            c = 1 + (1 if trend_bias == "bearish" else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("EMA 9/21 Crossover", "SHORT",
+                current_price, current_price + 2*atr, current_price - 3*atr,
+                f"EMA9 crossed below EMA21 · RSI {rsi14[last]:.0f}" if rsi14[last] else "EMA9 crossed below EMA21",
+                confluence=c))
+
+    # ── 2. EMA 21/50 Crossover ────────────────────────────────────────────
+    if all(x is not None for x in [ema21[last], ema50[last], ema21[prev], ema50[prev]]):
+        if ema21[last] > ema50[last] and ema21[prev] <= ema50[prev]:
+            signals.append(_sig("EMA 21/50 Cross", "LONG",
+                current_price, current_price - 2.5*atr, current_price + 4*atr,
+                "EMA21 crossed above EMA50 — medium-term trend shift bullish",
+                strength="High", confluence=2))
+        elif ema21[last] < ema50[last] and ema21[prev] >= ema50[prev]:
+            signals.append(_sig("EMA 21/50 Cross", "SHORT",
+                current_price, current_price + 2.5*atr, current_price - 4*atr,
+                "EMA21 crossed below EMA50 — medium-term trend shift bearish",
+                strength="High", confluence=2))
+
+    # ── 3. MACD Signal Cross ──────────────────────────────────────────────
+    if all(x is not None for x in [macd_line[last], sig_line[last], macd_line[prev], sig_line[prev]]):
+        if macd_line[last] > sig_line[last] and macd_line[prev] <= sig_line[prev]:
+            c = 1 + (1 if trend_bias == "bullish" else 0) + (1 if histogram[last] and histogram[last] > 0 else 0)
+            signals.append(_sig("MACD Cross", "LONG",
+                current_price, current_price - 2*atr, current_price + 3*atr,
+                f"MACD line crossed above signal · histogram {histogram[last]:.1f}" if histogram[last] else "MACD bullish cross",
+                confluence=c))
+        elif macd_line[last] < sig_line[last] and macd_line[prev] >= sig_line[prev]:
+            c = 1 + (1 if trend_bias == "bearish" else 0) + (1 if histogram[last] and histogram[last] < 0 else 0)
+            signals.append(_sig("MACD Cross", "SHORT",
+                current_price, current_price + 2*atr, current_price - 3*atr,
+                f"MACD line crossed below signal · histogram {histogram[last]:.1f}" if histogram[last] else "MACD bearish cross",
+                confluence=c))
+
+    # ── 4. RSI Extremes with divergence ───────────────────────────────────
     if rsi14[last] is not None:
-        rsi_val = rsi14[last]
-        if rsi_val < 30:
-            signals.append({
-                "strategy": "RSI Oversold",
-                "direction": "LONG",
-                "strength": "High" if rsi_val < 20 else "Medium",
-                "entry": round(current_price, 2),
-                "sl": round(lows[last] - atr * 0.5, 2),
-                "tp": round(current_price + 2 * atr, 2),
-                "reason": f"RSI at {rsi_val:.1f} — oversold reversal expected",
-            })
-        elif rsi_val > 70:
-            signals.append({
-                "strategy": "RSI Overbought",
-                "direction": "SHORT",
-                "strength": "High" if rsi_val > 80 else "Medium",
-                "entry": round(current_price, 2),
-                "sl": round(highs[last] + atr * 0.5, 2),
-                "tp": round(current_price - 2 * atr, 2),
-                "reason": f"RSI at {rsi_val:.1f} — overbought reversal expected",
-            })
+        r = rsi14[last]
+        if r < 30:
+            c = 1 + (1 if stoch_k[last] and stoch_k[last] < 20 else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("RSI Oversold", "LONG",
+                current_price, lows[last] - atr*0.5, current_price + 2.5*atr,
+                f"RSI={r:.0f} oversold · StochRSI={stoch_k[last]:.0f}" if stoch_k[last] else f"RSI={r:.0f} — oversold",
+                strength="High" if r < 20 else "Medium", confluence=c))
+        elif r > 70:
+            c = 1 + (1 if stoch_k[last] and stoch_k[last] > 80 else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("RSI Overbought", "SHORT",
+                current_price, highs[last] + atr*0.5, current_price - 2.5*atr,
+                f"RSI={r:.0f} overbought · StochRSI={stoch_k[last]:.0f}" if stoch_k[last] else f"RSI={r:.0f} — overbought",
+                strength="High" if r > 80 else "Medium", confluence=c))
 
-    # ── Support/Resistance bounce ──────────────────────────────────────────
+    # ── 5. Stochastic RSI Crossover ───────────────────────────────────────
+    if all(x is not None for x in [stoch_k[last], stoch_d[last], stoch_k[prev], stoch_d[prev]]):
+        if stoch_k[last] > stoch_d[last] and stoch_k[prev] <= stoch_d[prev] and stoch_k[last] < 30:
+            signals.append(_sig("StochRSI Cross", "LONG",
+                current_price, current_price - 1.5*atr, current_price + 2.5*atr,
+                f"StochRSI %K crossed above %D in oversold zone ({stoch_k[last]:.0f})",
+                confluence=2))
+        elif stoch_k[last] < stoch_d[last] and stoch_k[prev] >= stoch_d[prev] and stoch_k[last] > 70:
+            signals.append(_sig("StochRSI Cross", "SHORT",
+                current_price, current_price + 1.5*atr, current_price - 2.5*atr,
+                f"StochRSI %K crossed below %D in overbought zone ({stoch_k[last]:.0f})",
+                confluence=2))
+
+    # ── 6. Bollinger Band Squeeze / Breakout ──────────────────────────────
+    if bb_up[last] and bb_lo[last] and bb_mid[last]:
+        band_width = (bb_up[last] - bb_lo[last]) / bb_mid[last]
+        # Price touches lower band — bullish bounce
+        if current_price <= bb_lo[last] * 1.002:
+            c = 1 + (1 if rsi14[last] and rsi14[last] < 40 else 0) + (1 if trend_bias == "bullish" else 0)
+            signals.append(_sig("BB Lower Band Bounce", "LONG",
+                current_price, bb_lo[last] - atr*0.5, bb_mid[last],
+                f"Price at lower Bollinger Band ({bb_lo[last]}) — mean reversion LONG",
+                confluence=c))
+        # Price touches upper band — bearish rejection
+        elif current_price >= bb_up[last] * 0.998:
+            c = 1 + (1 if rsi14[last] and rsi14[last] > 60 else 0) + (1 if trend_bias == "bearish" else 0)
+            signals.append(_sig("BB Upper Band Rejection", "SHORT",
+                current_price, bb_up[last] + atr*0.5, bb_mid[last],
+                f"Price at upper Bollinger Band ({bb_up[last]}) — mean reversion SHORT",
+                confluence=c))
+        # BB Squeeze breakout
+        if band_width < 0.02 and vol_spike:
+            direction = "LONG" if closes[last] > bb_mid[last] else "SHORT"
+            signals.append(_sig("BB Squeeze Breakout", direction,
+                current_price,
+                current_price - atr if direction == "LONG" else current_price + atr,
+                current_price + 2.5*atr if direction == "LONG" else current_price - 2.5*atr,
+                f"Bollinger squeeze breakout with volume spike — {direction}",
+                strength="High", confluence=3))
+
+    # ── 7. VWAP Cross ─────────────────────────────────────────────────────
+    if vwap_line[last] and vwap_line[prev]:
+        if closes[last] > vwap_line[last] and closes[prev] <= vwap_line[prev]:
+            c = 1 + (1 if trend_bias == "bullish" else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("VWAP Cross", "LONG",
+                current_price, vwap_line[last] - atr*0.5, current_price + 2*atr,
+                f"Price crossed above VWAP ({vwap_line[last]}) — institutional bias LONG",
+                confluence=c))
+        elif closes[last] < vwap_line[last] and closes[prev] >= vwap_line[prev]:
+            c = 1 + (1 if trend_bias == "bearish" else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("VWAP Cross", "SHORT",
+                current_price, vwap_line[last] + atr*0.5, current_price - 2*atr,
+                f"Price crossed below VWAP ({vwap_line[last]}) — institutional bias SHORT",
+                confluence=c))
+
+    # ── 8. Supertrend flip ────────────────────────────────────────────────
+    if st_dir[last] != 0 and st_dir[prev] != 0 and st_dir[last] != st_dir[prev]:
+        direction = "LONG" if st_dir[last] == 1 else "SHORT"
+        c = 2 + (1 if trend_bias == ("bullish" if direction == "LONG" else "bearish") else 0)
+        signals.append(_sig("Supertrend Flip", direction,
+            current_price,
+            st_line[last] - atr if direction == "LONG" else st_line[last] + atr,  # type: ignore[operator]
+            current_price + 3*atr if direction == "LONG" else current_price - 3*atr,
+            f"Supertrend flipped {direction} at {st_line[last]} — strong trend change",
+            strength="High", confluence=c))
+
+    # ── 9. S/R Level Bounce ───────────────────────────────────────────────
     for lvl in sr_levels:
         dist = abs(current_price - lvl) / current_price
-        if dist < 0.003:  # within 0.3%
-            direction = "LONG" if current_price > lvl else "SHORT"
-            signals.append({
-                "strategy": "S/R Level",
-                "direction": direction,
-                "strength": "High",
-                "entry": round(current_price, 2),
-                "sl": round(lvl - atr if direction == "LONG" else lvl + atr, 2),
-                "tp": round(current_price + 2 * atr if direction == "LONG" else current_price - 2 * atr, 2),
-                "reason": f"Price at key {'support' if direction == 'LONG' else 'resistance'} level {lvl}",
-            })
+        if dist < 0.003:
+            direction = "LONG" if current_price >= lvl else "SHORT"
+            c = 1 + (1 if vwap_line[last] and abs(vwap_line[last] - lvl) / lvl < 0.003 else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("S/R Bounce", direction,
+                current_price,
+                lvl - atr if direction == "LONG" else lvl + atr,
+                current_price + 2*atr if direction == "LONG" else current_price - 2*atr,
+                f"Price at key {'support' if direction == 'LONG' else 'resistance'} {round(lvl,0)}",
+                confluence=c))
 
-    # ── Fair Value Gap fill ────────────────────────────────────────────────
+    # ── 10. Fair Value Gap Entry ──────────────────────────────────────────
     for fvg in fvgs:
         if fvg["bottom"] <= current_price <= fvg["top"]:
             direction = "LONG" if fvg["type"] == "bullish" else "SHORT"
-            signals.append({
-                "strategy": "Fair Value Gap",
-                "direction": direction,
-                "strength": "High",
-                "entry": round(current_price, 2),
-                "sl": round(fvg["bottom"] - atr * 0.5 if direction == "LONG" else fvg["top"] + atr * 0.5, 2),
-                "tp": round(fvg["top"] + atr if direction == "LONG" else fvg["bottom"] - atr, 2),
-                "reason": f"Price entering {fvg['type']} FVG zone {fvg['bottom']}–{fvg['top']}",
-            })
+            c = 2 + (1 if trend_bias == ("bullish" if direction == "LONG" else "bearish") else 0)
+            signals.append(_sig("Fair Value Gap", direction,
+                current_price,
+                fvg["bottom"] - atr*0.5 if direction == "LONG" else fvg["top"] + atr*0.5,
+                fvg["top"] + atr if direction == "LONG" else fvg["bottom"] - atr,
+                f"Price in {fvg['type']} FVG {round(fvg['bottom'],0)}–{round(fvg['top'],0)}",
+                strength="High", confluence=c))
 
-    # ── Liquidity sweep reversal ───────────────────────────────────────────
+    # ── 11. Liquidity Sweep Reversal ──────────────────────────────────────
     if sweeps:
-        latest_sweep = sweeps[-1]
-        if latest_sweep["time"] == candles[-1][0] or latest_sweep["time"] == candles[-2][0]:
-            direction = "LONG" if latest_sweep["type"] == "bullish_sweep" else "SHORT"
-            signals.append({
-                "strategy": "Liquidity Sweep",
-                "direction": direction,
-                "strength": "High",
-                "entry": round(current_price, 2),
-                "sl": round(latest_sweep["level"] - atr if direction == "LONG" else latest_sweep["level"] + atr, 2),
-                "tp": round(current_price + 3 * atr if direction == "LONG" else current_price - 3 * atr, 2),
-                "reason": f"{latest_sweep['type'].replace('_', ' ').title()} at {latest_sweep['level']}",
-            })
+        latest = sweeps[-1]
+        if latest["time"] in (candles[-1][0], candles[-2][0] if len(candles) > 1 else 0):
+            direction = "LONG" if latest["type"] == "bullish_sweep" else "SHORT"
+            c = 2 + (1 if vol_spike else 0)
+            signals.append(_sig("Liquidity Sweep", direction,
+                current_price,
+                latest["level"] - atr if direction == "LONG" else latest["level"] + atr,
+                current_price + 3*atr if direction == "LONG" else current_price - 3*atr,
+                f"{latest['type'].replace('_',' ').title()} at {latest['level']}",
+                strength="High", confluence=c))
 
-    # ── EMA trend with 50 ─────────────────────────────────────────────────
+    # ── 12. Order Block Entry ─────────────────────────────────────────────
+    for ob in ob_blocks:
+        if ob["bottom"] <= current_price <= ob["top"]:
+            direction = "LONG" if ob["type"] == "bullish" else "SHORT"
+            c = 2 + (1 if trend_bias == ("bullish" if direction == "LONG" else "bearish") else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("Order Block", direction,
+                current_price,
+                ob["bottom"] - atr*0.3 if direction == "LONG" else ob["top"] + atr*0.3,
+                ob["top"] + 2*atr if direction == "LONG" else ob["bottom"] - 2*atr,
+                f"Price in {ob['type']} order block {round(ob['bottom'],0)}–{round(ob['top'],0)}",
+                strength="High", confluence=c))
+
+    # ── 13. BOS / ChoCh Signal ───────────────────────────────────────────
+    for event in bos_choch:
+        if event["candle_idx"] >= last - 2:
+            direction = event["direction"]
+            label = event["type"]
+            c = 2 + (1 if trend_bias == ("bullish" if direction == "LONG" else "bearish") else 0)
+            signals.append(_sig(f"{label} Breakout", direction,
+                current_price,
+                current_price - 2*atr if direction == "LONG" else current_price + 2*atr,
+                current_price + 3.5*atr if direction == "LONG" else current_price - 3.5*atr,
+                f"{label} at {event['level']} — {'bullish' if direction == 'LONG' else 'bearish'} structure break",
+                strength="High", confluence=c))
+
+    # ── 14. EMA Trend Pullback ────────────────────────────────────────────
     if ema50[last] and ema21[last]:
-        trend = "bullish" if closes[last] > ema50[last] else "bearish"
-        if trend == "bullish" and closes[last] > ema21[last] and closes[last-1] <= ema21[last-1]:
-            signals.append({
-                "strategy": "EMA Trend Pullback",
-                "direction": "LONG",
-                "strength": "Medium",
-                "entry": round(current_price, 2),
-                "sl": round(ema50[last] - atr, 2),
-                "tp": round(current_price + 2.5 * atr, 2),
-                "reason": "Pullback to EMA 21 in uptrend (price above EMA 50)",
-            })
-        elif trend == "bearish" and closes[last] < ema21[last] and closes[last-1] >= ema21[last-1]:
-            signals.append({
-                "strategy": "EMA Trend Pullback",
-                "direction": "SHORT",
-                "strength": "Medium",
-                "entry": round(current_price, 2),
-                "sl": round(ema50[last] + atr, 2),
-                "tp": round(current_price - 2.5 * atr, 2),
-                "reason": "Pullback to EMA 21 in downtrend (price below EMA 50)",
-            })
+        if trend_bias == "bullish" and closes[last] > ema21[last] and closes[prev] <= ema21[prev]:
+            c = 1 + (1 if rsi14[last] and 40 < rsi14[last] < 60 else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("EMA Pullback", "LONG",
+                current_price, ema50[last] - atr, current_price + 2.5*atr,
+                f"Pullback to EMA21 in uptrend (above EMA50={round(ema50[last],0)})",
+                confluence=c))
+        elif trend_bias == "bearish" and closes[last] < ema21[last] and closes[prev] >= ema21[prev]:
+            c = 1 + (1 if rsi14[last] and 40 < rsi14[last] < 60 else 0) + (1 if vol_spike else 0)
+            signals.append(_sig("EMA Pullback", "SHORT",
+                current_price, ema50[last] + atr, current_price - 2.5*atr,
+                f"Pullback to EMA21 in downtrend (below EMA50={round(ema50[last],0)})",
+                confluence=c))
+
+    # ── 15. Candlestick Pattern Signals ──────────────────────────────────
+    recent_patterns = [p for p in patterns if p["candle_idx"] >= last - 1]
+    for pat in recent_patterns:
+        if pat["direction"] in ("LONG", "SHORT"):
+            direction = pat["direction"]
+            c = 1 + (1 if trend_bias == ("bullish" if direction == "LONG" else "bearish") else 0) + (1 if vol_spike else 0)
+            signals.append(_sig(pat["type"], direction,
+                current_price,
+                lows[last] - atr*0.5 if direction == "LONG" else highs[last] + atr*0.5,
+                current_price + 2*atr if direction == "LONG" else current_price - 2*atr,
+                f"{pat['type']} pattern — {direction.lower()} reversal signal",
+                strength=pat["strength"], confluence=c))
+
+    # ── 16. Volume Spike + Trend Continuation ────────────────────────────
+    if vol_spike and ema21[last]:
+        body = abs(closes[last] - opens[last])
+        rng  = highs[last] - lows[last]
+        if rng > 0 and body / rng > 0.6:
+            direction = "LONG" if closes[last] > opens[last] else "SHORT"
+            if (direction == "LONG" and trend_bias == "bullish") or (direction == "SHORT" and trend_bias == "bearish"):
+                signals.append(_sig("Volume Spike Continuation", direction,
+                    current_price,
+                    lows[last] - atr*0.3 if direction == "LONG" else highs[last] + atr*0.3,
+                    current_price + 2.5*atr if direction == "LONG" else current_price - 2.5*atr,
+                    f"Strong {direction.lower()} candle with volume spike ({int(vols[last]/avg_vol*100)}% of avg)",
+                    strength="High", confluence=3))
+
+    # ── De-duplicate: keep highest-confluence signal per strategy ─────────
+    seen: dict = {}
+    for s in signals:
+        key = s["strategy"]
+        if key not in seen or s["confluence"] > seen[key]["confluence"]:
+            seen[key] = s
+    signals = sorted(seen.values(), key=lambda x: (-x["confluence"], x["strategy"]))
+
+    # Mark top-3 as "High" strength
+    for i, s in enumerate(signals):
+        if i < 3 and s["confluence"] >= 2:
+            s["strength"] = "High"
+
+    ema200_val = ema200[last] if ema200[last] else None
+    vwap_val   = vwap_line[last]
+    bb_pct     = round((current_price - bb_lo[last]) / (bb_up[last] - bb_lo[last]) * 100, 1) if bb_up[last] and bb_lo[last] and bb_up[last] != bb_lo[last] else None
 
     return {
         "signals": signals,
         "indicators": {
-            "ema9":  round(ema9[last], 2)  if ema9[last]  else None,
-            "ema21": round(ema21[last], 2) if ema21[last] else None,
-            "ema50": round(ema50[last], 2) if ema50[last] else None,
-            "rsi14": round(rsi14[last], 2) if rsi14[last] else None,
-            "atr14": round(atr, 2),
-            "trend": "bullish" if ema50[last] and closes[last] > ema50[last] else "bearish" if ema50[last] else "neutral",
+            "ema9":    round(ema9[last], 2)   if ema9[last]   else None,
+            "ema21":   round(ema21[last], 2)  if ema21[last]  else None,
+            "ema50":   round(ema50[last], 2)  if ema50[last]  else None,
+            "ema200":  round(ema200_val, 2)   if ema200_val   else None,
+            "rsi14":   round(rsi14[last], 2)  if rsi14[last]  else None,
+            "atr14":   round(atr, 2),
+            "vwap":    vwap_val,
+            "bb_upper": bb_up[last],
+            "bb_lower": bb_lo[last],
+            "bb_pct":  bb_pct,
+            "macd":    round(macd_line[last], 2) if macd_line[last] else None,
+            "macd_signal": round(sig_line[last], 2) if sig_line[last] else None,
+            "macd_hist":   round(histogram[last], 2) if histogram[last] else None,
+            "stoch_k": stoch_k[last],
+            "stoch_d": stoch_d[last],
+            "supertrend": st_line[last],
+            "supertrend_dir": st_dir[last],
+            "vol_spike": vol_spike,
+            "trend": trend_bias,
         },
         "sr_levels": sr_levels[-10:],
         "fvgs": fvgs,
         "liquidity_sweeps": sweeps,
+        "patterns": patterns[-5:],
+        "order_blocks": ob_blocks,
+        "bos_choch": bos_choch,
     }
 
 
@@ -401,7 +854,41 @@ async def get_candles(
 
         loop = asyncio.get_event_loop()
         candles = await loop.run_in_executor(None, _fetch)
-        return {"candles": candles, "interval": interval, "symbol": symbol}
+
+        # Compute overlay data for chart drawing
+        closes = [c[4] for c in candles]
+        ema9_vals  = _ema(closes, 9)
+        ema21_vals = _ema(closes, 21)
+        ema50_vals = _ema(closes, 50)
+        vwap_vals  = _vwap(candles)
+        bb_up, bb_mid, bb_lo = _bollinger_bands(closes, 20)
+        st_line, st_dir = _supertrend(candles, 10, 3.0)
+        IST = 5.5 * 3600
+
+        def _overlay(vals):
+            return [
+                {"time": int(candles[i][0] + IST), "value": round(v, 2)}
+                for i, v in enumerate(vals) if v is not None
+            ]
+
+        return {
+            "candles": candles,
+            "interval": interval,
+            "symbol": symbol,
+            "overlays": {
+                "ema9":       _overlay(ema9_vals),
+                "ema21":      _overlay(ema21_vals),
+                "ema50":      _overlay(ema50_vals),
+                "vwap":       _overlay(vwap_vals),
+                "bb_upper":   _overlay(bb_up),
+                "bb_lower":   _overlay(bb_lo),
+                "bb_mid":     _overlay(bb_mid),
+                "supertrend": [
+                    {"time": int(candles[i][0] + IST), "value": round(st_line[i], 2), "dir": st_dir[i]}
+                    for i in range(len(candles)) if st_line[i] is not None
+                ],
+            },
+        }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Groww API error: {e}")
 
