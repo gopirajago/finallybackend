@@ -467,7 +467,7 @@ def _find_bos_choch(candles: list[list]) -> list[dict]:
     return events[-4:]
 
 
-def _analyze_strategies(candles: list[list], current_price: float) -> dict:
+def _analyze_strategies(candles: list[list], current_price: float, interval: int = 5) -> dict:
     """Run all strategies and return signals with Entry/SL/TP + confluence scoring."""
     if len(candles) < 20:
         return {"signals": [], "indicators": {}, "patterns": [], "order_blocks": [], "bos_choch": []}
@@ -1176,7 +1176,7 @@ async def get_signals(
         candles = candles if isinstance(candles, list) else []
         ltp = float(ltp_data) if ltp_data else (candles[-1][4] if candles else 0)
 
-        analysis = _analyze_strategies(candles, ltp)
+        analysis = _analyze_strategies(candles, ltp, interval)
         return {
             "symbol": symbol,
             "interval": interval,
@@ -1369,7 +1369,7 @@ async def get_ai_signal(
 
     candles = hist_data.get("candles", []) if isinstance(hist_data, dict) else []
     ltp = float(ltp_data) if ltp_data else (candles[-1][4] if candles else 0)
-    analysis = _analyze_strategies(candles, ltp)
+    analysis = _analyze_strategies(candles, ltp, interval)
 
     # Add quote metadata to analysis
     if isinstance(quote_data, dict):
