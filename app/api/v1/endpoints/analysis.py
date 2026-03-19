@@ -951,8 +951,80 @@ def _analyze_strategies(candles: list[list], current_price: float, interval: int
     vwap_val   = vwap_line[last]
     bb_pct     = round((current_price - bb_lo[last]) / (bb_up[last] - bb_lo[last]) * 100, 1) if bb_up[last] and bb_lo[last] and bb_up[last] != bb_lo[last] else None
 
+    # ── Market regime detection ───────────────────────────────────────────
+    band_width_now = (bb_up[last] - bb_lo[last]) / bb_mid[last] if bb_up[last] and bb_lo[last] and bb_mid[last] else 0
+    slope_5 = abs(ema21[last] - ema21[last - 5]) / current_price * 100 if last >= 5 and ema21[last] and ema21[last-5] else 0
+    if band_width_now > 0.04 and slope_5 > 0.03:
+        regime = "trending"
+    elif band_width_now < 0.02:
+        regime = "squeeze"
+    else:
+        regime = "ranging"
+
+    # ── Best trade: highest-confluence signal that aligns with trend ──────
+    best_trade = None
+    aligned = [s for s in signals if
+               (s["direction"] == "LONG" and trend_bias == "bullish") or
+               (s["direction"] == "SHORT" and trend_bias == "bearish")]
+    candidates = aligned if aligned else signals
+    if candidates:
+        bt = candidates[0]  # already sorted by -confluence
+        # Compute risk/reward quality score
+        rr_score = min(bt["rr"], 4.0) / 4.0  # cap at 4R
+        conf_score = bt["confluence"] / 4.0
+        quality = round((rr_score * 0.4 + conf_score * 0.6) * 100)
+
+        # Key confluences that support this trade
+        supporting: list[str] = []
+        if vwap_val:
+            if bt["direction"] == "LONG" and current_price > vwap_val:
+                supporting.append(f"Price above VWAP ({round(vwap_val, 0):.0f}) — bullish institutional bias")
+            elif bt["direction"] == "SHORT" and current_price < vwap_val:
+                supporting.append(f"Price below VWAP ({round(vwap_val, 0):.0f}) — bearish institutional bias")
+        if st_dir[last] != 0:
+            st_txt = "Supertrend bullish" if st_dir[last] == 1 else "Supertrend bearish"
+            if (bt["direction"] == "LONG" and st_dir[last] == 1) or (bt["direction"] == "SHORT" and st_dir[last] == -1):
+                supporting.append(f"{st_txt} — trend aligned")
+        if ema9[last] and ema21[last] and ema50[last]:
+            if bt["direction"] == "LONG" and ema9[last] > ema21[last] > ema50[last]:
+                supporting.append("EMA stack bullish (9>21>50)")
+            elif bt["direction"] == "SHORT" and ema9[last] < ema21[last] < ema50[last]:
+                supporting.append("EMA stack bearish (9<21<50)")
+        if rsi14[last]:
+            r = rsi14[last]
+            if bt["direction"] == "LONG" and 45 <= r <= 65:
+                supporting.append(f"RSI {r:.0f} — momentum zone")
+            elif bt["direction"] == "SHORT" and 35 <= r <= 55:
+                supporting.append(f"RSI {r:.0f} — momentum zone")
+        for fvg in fvgs:
+            if fvg["bottom"] <= current_price <= fvg["top"]:
+                supporting.append(f"{fvg['type'].title()} FVG — price in imbalance zone ({round(fvg['bottom'],0):.0f}–{round(fvg['top'],0):.0f})")
+        for ob in ob_blocks:
+            if ob["bottom"] <= current_price <= ob["top"]:
+                supporting.append(f"{ob['type'].title()} Order Block — institutional zone ({round(ob['bottom'],0):.0f}–{round(ob['top'],0):.0f})")
+        if vol_spike:
+            supporting.append("Volume spike — institutional activity")
+
+        # Nearest S/R levels
+        nearest_support = max((lvl for lvl in sr_levels if lvl < current_price), default=None)
+        nearest_resistance = min((lvl for lvl in sr_levels if lvl > current_price), default=None)
+
+        best_trade = {
+            **bt,
+            "quality_score": quality,
+            "regime": regime,
+            "trend_alignment": bt["direction"] == ("LONG" if trend_bias == "bullish" else "SHORT"),
+            "supporting_factors": supporting[:5],
+            "risk_amount": round(abs(bt["entry"] - bt["sl"]), 2),
+            "reward_amount": round(abs(bt["tp"] - bt["entry"]), 2),
+            "nearest_support": round(nearest_support, 2) if nearest_support else None,
+            "nearest_resistance": round(nearest_resistance, 2) if nearest_resistance else None,
+        }
+
     return {
         "signals": signals,
+        "best_trade": best_trade,
+        "regime": regime,
         "indicators": {
             "ema9":    round(ema9[last], 2)   if ema9[last]   else None,
             "ema21":   round(ema21[last], 2)  if ema21[last]  else None,
@@ -994,6 +1066,8 @@ async def list_instruments():
 async def get_candles(
     symbol: str = Query(...),
     interval: int = Query(5, description="Interval in minutes: 1, 3, 5, 15, 60"),
+    from_time: int | None = Query(None, description="Unix epoch seconds – fetch bars BEFORE this time (for infinite scroll left)"),
+    to_time:   int | None = Query(None, description="Unix epoch seconds – fetch bars up to this time"),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1004,16 +1078,24 @@ async def get_candles(
     groww = await _get_groww(current_user, db)
 
     now = datetime.now()
-    lookback = {
-        1:  timedelta(days=1),
-        3:  timedelta(days=2),
-        5:  timedelta(weeks=1),
-        15: timedelta(days=30),
-        60: timedelta(days=90),
-        1440: timedelta(days=1095),
-    }.get(interval, timedelta(days=1))
-    start_time = (now - lookback).strftime("%Y-%m-%d %H:%M:%S")
-    end_time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Date range resolution ─────────────────────────────────────────────────
+    # If from_time supplied → user is scrolling left; fetch one page ending at from_time
+    if from_time is not None:
+        end_dt   = datetime.fromtimestamp(from_time)
+        page_days = {1: 1, 3: 2, 5: 7, 15: 30, 60: 90, 1440: 365}.get(interval, 7)
+        start_dt = end_dt - timedelta(days=page_days)
+    else:
+        end_dt   = datetime.fromtimestamp(to_time) if to_time else now
+        lookback = {
+            1:  timedelta(days=1),
+            3:  timedelta(days=2),
+            5:  timedelta(weeks=1),
+            15: timedelta(days=30),
+            60: timedelta(days=90),
+            1440: timedelta(days=1095),
+        }.get(interval, timedelta(days=1))
+        start_dt = end_dt - lookback
 
     try:
         def _fetch():
@@ -1024,8 +1106,8 @@ async def get_candles(
                 trading_symbol=instr["trading_symbol"],
                 exchange=exchange,
                 segment=segment,
-                start_dt=now - lookback,
-                end_dt=now,
+                start_dt=start_dt,
+                end_dt=end_dt,
                 interval=interval,
             )
 
@@ -1132,15 +1214,15 @@ async def get_signals(
     groww = await _get_groww(current_user, db)
 
     now = datetime.now()
-    # Interval → lookback window
+    # Interval → lookback window (generous history for quality signals)
     lookback = {
-        1:  timedelta(days=1),
-        3:  timedelta(days=2),
-        5:  timedelta(weeks=1),
-        15: timedelta(days=30),
-        60: timedelta(days=90),
+        1:    timedelta(days=5),
+        3:    timedelta(days=10),
+        5:    timedelta(days=30),
+        15:   timedelta(days=90),
+        60:   timedelta(days=365),
         1440: timedelta(days=1095),
-    }.get(interval, timedelta(days=1))
+    }.get(interval, timedelta(days=5))
     start_time = (now - lookback).strftime("%Y-%m-%d %H:%M:%S")
     end_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1186,7 +1268,8 @@ async def get_signals(
             "timestamp": int(datetime.now().timestamp()),
         }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Analysis error: {e}")
+        import traceback as _tb
+        raise HTTPException(status_code=502, detail=f"Analysis error: {e}\n{_tb.format_exc()}")
 
 
 # ── News sentiment helper ──────────────────────────────────────────────────────
